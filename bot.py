@@ -12,16 +12,13 @@ TOKEN = os.getenv("TOKEN")
 if not TOKEN:
     raise RuntimeError("TOKEN env var is not set")
 
-# Защита сброса: задай RESET_CODE в окружении (любой пароль).
-# Если RESET_CODE не задан — /reset будет недоступен.
-RESET_CODE = os.getenv("RESET_CODE")  # например: "santa2025"
+RESET_CODE = os.getenv("RESET_CODE")  # если задан — /reset КОД доступен
 
 EVENT_TITLE = "🎄 Тайный Санта 2025"
 EVENT_DATE = "25.12.2025"
 BUDGET = "200 ₽"
 COUNTDOWN_SECONDS = 10
 
-# Участники (вшито в код)
 PARTICIPANTS: List[str] = [
     "Алёна",
     "Ирина",
@@ -31,8 +28,6 @@ PARTICIPANTS: List[str] = [
 ]
 
 DATA_FILE = "santa_state.json"
-
-# =================================================
 
 bot = telebot.TeleBot(TOKEN, parse_mode="HTML")
 
@@ -44,10 +39,18 @@ def load_state() -> Dict:
             "chosen": {},          # user_id(str) -> name(str)
             "pairs": {},           # giver_name -> receiver_name
             "drawn_at": None,      # timestamp
-            "draw_in_progress": False
+            "draw_in_progress": False,
+            "ui": {}               # user_id(str) -> {"chat_id": int, "message_id": int}
         }
     with open(DATA_FILE, "r", encoding="utf-8") as f:
-        return json.load(f)
+        data = json.load(f)
+    # на всякий случай докидываем ключи
+    data.setdefault("chosen", {})
+    data.setdefault("pairs", {})
+    data.setdefault("drawn_at", None)
+    data.setdefault("draw_in_progress", False)
+    data.setdefault("ui", {})
+    return data
 
 
 def save_state(state: Dict) -> None:
@@ -64,12 +67,11 @@ def name_taken(name: str, state: Dict) -> bool:
 
 
 def all_registered(state: Dict) -> bool:
-    # все имена должны быть заняты (каждое ровно одним человеком)
     chosen_names = set(state.get("chosen", {}).values())
     return len(chosen_names) == len(PARTICIPANTS)
 
 
-# ================== ДИЗАЙН / ТЕКСТЫ ==================
+# ================== UI / ТЕКСТЫ ==================
 def header() -> str:
     return (
         f"❄️ <b>{EVENT_TITLE}</b> ❄️\n"
@@ -79,7 +81,7 @@ def header() -> str:
     )
 
 
-def pretty_progress(state: Dict) -> str:
+def progress_line(state: Dict) -> str:
     got = len(set(state.get("chosen", {}).values()))
     total = len(PARTICIPANTS)
     left = total - got
@@ -88,22 +90,56 @@ def pretty_progress(state: Dict) -> str:
     return f"⏳ Готовность: <b>{got}/{total}</b> (осталось: <b>{left}</b>)"
 
 
-# ================== КНОПКИ ==================
-def kb_choose_name(state: Dict) -> types.InlineKeyboardMarkup:
-    """
-    Пока не все выбрались — показываем только список имён + профиль.
-    Когда все выбрались — добавляем кнопку жеребьёвки.
-    """
+def panel_text_for(user_id: int, state: Dict) -> str:
+    my = chosen_name_of(user_id, state)
+    if state.get("pairs"):
+        t = (
+            f"{header()}\n\n"
+            "🎉 <b>Жеребьёвка уже проведена!</b>\n"
+            "Нажми кнопку ниже, чтобы увидеть <b>только свою</b> пару.\n\n"
+            "☃️ Не раскрывай свою пару другим 🙂\n"
+        )
+        if my:
+            t += f"\n👤 Ты: <b>{my}</b>"
+        else:
+            t += "\n👤 Ты не выбрал себя до жеребьёвки. Напиши /start в самом начале следующей игры."
+        return t
+
+    t = (
+        f"{header()}\n\n"
+        "🎅 Правила:\n"
+        "1) Выбери, <b>кто ты</b>, кнопкой ниже\n"
+        "2) Когда все выберут себя — появится кнопка <b>🎲 Жеребьёвка</b>\n"
+        "3) После выбора <b>нельзя поменять имя</b>\n"
+        "4) После жеребьёвки каждый увидит <b>только свою</b> пару\n\n"
+        f"{progress_line(state)}\n"
+    )
+    if my:
+        t += f"\n👤 Ты уже выбран как: <b>{my}</b> ✅"
+    else:
+        t += "\n👤 Ты ещё не выбран."
+    return t
+
+
+def kb_choose_name(user_id: int, state: Dict) -> types.InlineKeyboardMarkup:
     kb = types.InlineKeyboardMarkup(row_width=1)
 
+    my = chosen_name_of(user_id, state)
     for name in PARTICIPANTS:
-        mark = " ✅" if name_taken(name, state) else ""
+        taken = name_taken(name, state)
+        mark = " ✅" if taken else ""
+        # если имя занято НЕ этим пользователем — делаем кнопку "недоступной" через callback, но внешне показываем
         kb.add(types.InlineKeyboardButton(f"🎁 {name}{mark}", callback_data=f"pick:{name}"))
 
     kb.add(types.InlineKeyboardButton("👤 Мой профиль", callback_data="me"))
 
+    # Кнопка жеребьёвки появляется только когда все выбрали себя и жеребьёвка ещё не проведена
     if all_registered(state) and not state.get("pairs") and not state.get("draw_in_progress"):
         kb.add(types.InlineKeyboardButton("🎲 Жеребьёвка", callback_data="draw"))
+
+    # если пользователь уже выбрал себя — можно показать "ожидаем"
+    if my and (not all_registered(state)) and (not state.get("pairs")):
+        kb.add(types.InlineKeyboardButton("⏳ Ждём остальных", callback_data="noop"))
 
     return kb
 
@@ -115,14 +151,56 @@ def kb_after_draw() -> types.InlineKeyboardMarkup:
     return kb
 
 
+def safe_edit(chat_id: int, message_id: int, text: str, reply_markup: Optional[types.InlineKeyboardMarkup]):
+    try:
+        bot.edit_message_text(
+            chat_id=chat_id,
+            message_id=message_id,
+            text=text,
+            parse_mode="HTML",
+            reply_markup=reply_markup
+        )
+        return True
+    except Exception:
+        return False
+
+
+def broadcast_refresh(state: Dict):
+    """
+    Обновляет панели всем пользователям, которые когда-либо нажимали /start.
+    Для маленького списка (5 участников) — безопасно.
+    """
+    ui = state.get("ui", {})
+    to_delete = []
+    for uid_str, meta in ui.items():
+        try:
+            uid = int(uid_str)
+            chat_id = int(meta["chat_id"])
+            msg_id = int(meta["message_id"])
+        except Exception:
+            to_delete.append(uid_str)
+            continue
+
+        if state.get("pairs"):
+            ok = safe_edit(chat_id, msg_id, panel_text_for(uid, state), kb_after_draw())
+        else:
+            ok = safe_edit(chat_id, msg_id, panel_text_for(uid, state), kb_choose_name(uid, state))
+
+        # если не получилось — скорее всего сообщение удалили/чат недоступен
+        if not ok:
+            to_delete.append(uid_str)
+
+        time.sleep(0.1)  # маленькая пауза против лимитов
+
+    for k in to_delete:
+        ui.pop(k, None)
+
+    state["ui"] = ui
+    save_state(state)
+
+
 # ================== ЖЕРЕБЬЁВКА ==================
 def build_pairs(names: List[str]) -> Dict[str, str]:
-    """
-    Делает перестановку без совпадений (никто не дарит сам себе).
-    """
-    if len(names) < 2:
-        raise ValueError("Нужно минимум 2 участника")
-
     receivers = names[:]
     for _ in range(200):
         random.shuffle(receivers)
@@ -135,54 +213,37 @@ def build_pairs(names: List[str]) -> Dict[str, str]:
 @bot.message_handler(commands=["start", "help"])
 def start(message: types.Message):
     state = load_state()
-    my = chosen_name_of(message.from_user.id, state)
 
+    # отправляем панель и сохраняем message_id, чтобы потом редактировать всем
+    text = panel_text_for(message.from_user.id, state)
     if state.get("pairs"):
-        text = (
-            f"{header()}\n\n"
-            "🎉 <b>Жеребьёвка уже проведена!</b>\n"
-            "Нажми кнопку ниже, чтобы увидеть только свою пару.\n\n"
-            "☃️ Не раскрывай свою пару другим — так интереснее!\n"
-        )
-        if my:
-            text += f"\n👤 Ты: <b>{my}</b>"
-        bot.send_message(message.chat.id, text, reply_markup=kb_after_draw())
-        return
+        sent = bot.send_message(message.chat.id, text, reply_markup=kb_after_draw())
+    else:
+        sent = bot.send_message(message.chat.id, text, reply_markup=kb_choose_name(message.from_user.id, state))
 
-    text = (
-        f"{header()}\n\n"
-        "🎅 Правила простые:\n"
-        "1) Выбери, <b>кто ты</b>, кнопкой ниже\n"
-        "2) Когда все выберут себя — появится кнопка <b>🎲 Жеребьёвка</b>\n"
-        "3) После жеребьёвки каждый увидит <b>только свою</b> пару\n\n"
-        f"{pretty_progress(state)}\n"
-    )
-    if my:
-        text += f"\n👤 Ты уже выбран как: <b>{my}</b> ✅"
+    state["ui"][str(message.from_user.id)] = {"chat_id": message.chat.id, "message_id": sent.message_id}
+    save_state(state)
 
-    bot.send_message(message.chat.id, text, reply_markup=kb_choose_name(state))
+    # сразу обновим всем (например, чтобы у других появились ✅, если они открыли бота позже)
+    broadcast_refresh(load_state())
 
 
 # ================== /reset ==================
 @bot.message_handler(commands=["reset"])
 def reset(message: types.Message):
     if not RESET_CODE:
-        bot.send_message(message.chat.id, "♻️ Сброс отключён (нет RESET_CODE на сервере).")
+        bot.send_message(message.chat.id, "♻️ Сброс отключён (на сервере не задан RESET_CODE).")
         return
 
-    # ожидаем: /reset код
     parts = (message.text or "").strip().split(maxsplit=1)
     if len(parts) != 2 or parts[1] != RESET_CODE:
-        bot.send_message(
-            message.chat.id,
-            "♻️ Нужен код сброса.\n"
-            "Формат: <code>/reset КОД</code>"
-        )
+        bot.send_message(message.chat.id, "♻️ Нужен код. Формат: <code>/reset КОД</code>")
         return
 
-    state = {"chosen": {}, "pairs": {}, "drawn_at": None, "draw_in_progress": False}
+    state = {"chosen": {}, "pairs": {}, "drawn_at": None, "draw_in_progress": False, "ui": load_state().get("ui", {})}
     save_state(state)
-    bot.send_message(message.chat.id, "♻️ Игра сброшена! Можно выбирать себя заново 🎄", reply_markup=kb_choose_name(state))
+    bot.send_message(message.chat.id, "♻️ Игра сброшена! Можно начинать заново 🎄")
+    broadcast_refresh(load_state())
 
 
 # ================== CALLBACKS ==================
@@ -191,26 +252,17 @@ def callbacks(call: types.CallbackQuery):
     state = load_state()
     uid = call.from_user.id
 
-    # профиль
-    if call.data == "me":
-        my = chosen_name_of(uid, state)
-        text = (
-            f"{header()}\n\n"
-            f"{pretty_progress(state)}\n\n"
-        )
-        if my:
-            text += f"👤 Ты: <b>{my}</b>\n"
-        else:
-            text += "👤 Ты пока не выбран.\n"
+    if call.data == "noop":
+        bot.answer_callback_query(call.id, "Ждём 🙂")
+        return
 
+    if call.data == "me":
+        bot.answer_callback_query(call.id, "Профиль")
+        # просто обновим панель этому пользователю
         if state.get("pairs"):
-            text += "\n🎁 Жеребьёвка уже была. Нажми «Моя пара»."
-            bot.answer_callback_query(call.id, "Профиль")
-            bot.send_message(call.message.chat.id, text, reply_markup=kb_after_draw())
+            bot.send_message(call.message.chat.id, panel_text_for(uid, state), reply_markup=kb_after_draw())
         else:
-            text += "\nВыбери себя из списка ниже:"
-            bot.answer_callback_query(call.id, "Профиль")
-            bot.send_message(call.message.chat.id, text, reply_markup=kb_choose_name(state))
+            bot.send_message(call.message.chat.id, panel_text_for(uid, state), reply_markup=kb_choose_name(uid, state))
         return
 
     # выбор имени
@@ -218,45 +270,38 @@ def callbacks(call: types.CallbackQuery):
         name = call.data.split(":", 1)[1]
 
         if state.get("pairs"):
-            bot.answer_callback_query(call.id, "Жеребьёвка уже прошла. Смена недоступна.", show_alert=True)
+            bot.answer_callback_query(call.id, "Жеребьёвка уже была. Смена недоступна.", show_alert=True)
             return
+
         if state.get("draw_in_progress"):
             bot.answer_callback_query(call.id, "Жеребьёвка запускается. Подожди.", show_alert=True)
             return
 
-        # проверка занятости
-        owner = None
-        for k, v in state.get("chosen", {}).items():
-            if v == name:
-                owner = int(k)
-                break
-        if owner is not None and owner != uid:
-            bot.answer_callback_query(call.id, "Это имя уже заняли.", show_alert=True)
+        already = chosen_name_of(uid, state)
+        if already:
+            # ВАЖНО: запрет смены
+            bot.answer_callback_query(call.id, "Ты уже подтвердил себя. Менять нельзя ✅", show_alert=True)
             return
 
-        # записываем выбор
+        # если имя занято другим
+        for k, v in state.get("chosen", {}).items():
+            if v == name and k != str(uid):
+                bot.answer_callback_query(call.id, "Это имя уже заняли ✅", show_alert=True)
+                return
+
         state.setdefault("chosen", {})[str(uid)] = name
         save_state(state)
 
-        bot.answer_callback_query(call.id, f"Ты выбрал: {name}")
-        msg = (
-            f"{header()}\n\n"
-            f"✅ Готово! Ты: <b>{name}</b>\n\n"
-            f"{pretty_progress(state)}\n"
-        )
-        if all_registered(state):
-            msg += "\n🎲 Теперь можно запускать жеребьёвку!"
-        else:
-            msg += "\n❄️ Ждём остальных…"
+        bot.answer_callback_query(call.id, f"Готово: {name} ✅")
 
-        bot.send_message(call.message.chat.id, msg, reply_markup=kb_choose_name(state))
+        # обновляем панели всем
+        broadcast_refresh(load_state())
         return
 
     # жеребьёвка
     if call.data == "draw":
         if state.get("pairs"):
             bot.answer_callback_query(call.id, "Уже проведено.", show_alert=True)
-            bot.send_message(call.message.chat.id, "🎲 Жеребьёвка уже была.", reply_markup=kb_after_draw())
             return
 
         if state.get("draw_in_progress"):
@@ -265,23 +310,18 @@ def callbacks(call: types.CallbackQuery):
 
         if not all_registered(state):
             bot.answer_callback_query(call.id, "Ещё не все готовы.", show_alert=True)
-            bot.send_message(
-                call.message.chat.id,
-                f"{header()}\n\n"
-                "⏳ Пока не все выбрали себя.\n"
-                f"{pretty_progress(state)}",
-                reply_markup=kb_choose_name(state)
-            )
             return
 
-        # блокируем
+        # блокируем и обновляем всем (чтобы кнопка draw исчезла, если надо)
         state["draw_in_progress"] = True
         save_state(state)
+        broadcast_refresh(load_state())
 
         bot.answer_callback_query(call.id, "Запускаю 🎲")
-        msg = bot.send_message(call.message.chat.id, f"🎄 Начинаем через <b>{COUNTDOWN_SECONDS}</b>…", parse_mode="HTML")
 
-        # обратный отсчёт
+        # обратный отсчёт в сообщении, которое нажали (может быть не панель)
+        msg = bot.send_message(call.message.chat.id, f"🎄 Жеребьёвка через <b>{COUNTDOWN_SECONDS}</b>…")
+
         for s in range(COUNTDOWN_SECONDS, 0, -1):
             try:
                 bot.edit_message_text(
@@ -295,15 +335,16 @@ def callbacks(call: types.CallbackQuery):
             time.sleep(1)
 
         try:
-            # строим пары по именам
             pairs = build_pairs(PARTICIPANTS[:])
+            state = load_state()
             state["pairs"] = pairs
             state["drawn_at"] = int(time.time())
             save_state(state)
 
-            # каждому — в личку
             sent = 0
             failed = 0
+
+            # рассылаем только тем, кто выбрал себя
             for user_id_str, my_name in state.get("chosen", {}).items():
                 user_id = int(user_id_str)
                 receiver_name = pairs.get(my_name)
@@ -314,7 +355,7 @@ def callbacks(call: types.CallbackQuery):
                         f"{header()}\n\n"
                         "🎁 <b>Твоя пара готова!</b>\n\n"
                         f"Ты даришь: <b>{receiver_name}</b>\n\n"
-                        "✨ Пусть подарок будет тёплым и добрым!\n"
+                        "✨ С наступающим! Пусть подарок будет классным 🎄\n"
                         "🤫 Пару не раскрываем 🙂",
                         reply_markup=kb_after_draw()
                     )
@@ -322,7 +363,6 @@ def callbacks(call: types.CallbackQuery):
                 except Exception:
                     failed += 1
 
-            # итоговое сообщение
             bot.edit_message_text(
                 chat_id=msg.chat.id,
                 message_id=msg.message_id,
@@ -337,10 +377,10 @@ def callbacks(call: types.CallbackQuery):
             )
 
         finally:
-            # снимаем блокировку
             state = load_state()
             state["draw_in_progress"] = False
             save_state(state)
+            broadcast_refresh(load_state())
 
         return
 
@@ -349,13 +389,11 @@ def callbacks(call: types.CallbackQuery):
         state = load_state()
         if not state.get("pairs"):
             bot.answer_callback_query(call.id, "Жеребьёвки ещё не было.", show_alert=True)
-            bot.send_message(call.message.chat.id, "🎲 Сначала нужно провести жеребьёвку.", reply_markup=kb_choose_name(state))
             return
 
         my = chosen_name_of(uid, state)
         if not my:
-            bot.answer_callback_query(call.id, "Сначала выбери себя.", show_alert=True)
-            bot.send_message(call.message.chat.id, "Нажми /start и выбери, кто ты.", reply_markup=kb_choose_name(state))
+            bot.answer_callback_query(call.id, "Ты не выбирал себя.", show_alert=True)
             return
 
         receiver = state["pairs"].get(my)
@@ -365,7 +403,7 @@ def callbacks(call: types.CallbackQuery):
             f"{header()}\n\n"
             "🎁 <b>Твоя пара</b>\n\n"
             f"Ты даришь: <b>{receiver}</b>\n\n"
-            "🎄 Удачи! И хорошего настроения 😊",
+            "🎄 Удачи! И классного настроения 😊",
             reply_markup=kb_after_draw()
         )
         return
@@ -373,7 +411,6 @@ def callbacks(call: types.CallbackQuery):
     bot.answer_callback_query(call.id, "Неизвестная кнопка.")
 
 
-# ================== RUN ==================
 if __name__ == "__main__":
     print("Santa bot started...")
     bot.infinity_polling(skip_pending=True)
