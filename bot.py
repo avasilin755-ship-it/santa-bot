@@ -1,9 +1,8 @@
 import os
 import json
-import random
 import time
-import threading
-from typing import Dict, List, Optional
+import random
+from typing import Dict, Optional
 
 import telebot
 from telebot import types
@@ -14,290 +13,265 @@ if not TOKEN:
 
 bot = telebot.TeleBot(TOKEN, parse_mode="HTML")
 
-DATA_FILE = "santa_data.json"
-
-# Настройки игры
+# ===== НАСТРОЙКИ ИГРЫ =====
 EVENT_DATE = "25.12.2025"
 BUDGET = "200 ₽"
-COUNTDOWN_SECONDS = 10
+
+# Список участников ЗДЕСЬ:
+PARTICIPANTS = [
+    "Алёна",
+    "Ирина",
+    "Мария",
+    "Марина",
+    "Юлия",
+]
+
+DATA_FILE = "santa_state.json"
 
 
-def load_data() -> Dict:
+# ===== ХРАНЕНИЕ =====
+def load_state() -> Dict:
     if not os.path.exists(DATA_FILE):
-        return {"games": {}}
+        return {
+            "chosen": {},   # user_id(str) -> name(str)
+            "pairs": {},    # giver_name -> receiver_name
+            "drawn_at": None
+        }
     with open(DATA_FILE, "r", encoding="utf-8") as f:
         return json.load(f)
 
 
-def save_data(data: Dict) -> None:
+def save_state(state: Dict) -> None:
     with open(DATA_FILE, "w", encoding="utf-8") as f:
-        json.dump(data, f, ensure_ascii=False, indent=2)
+        json.dump(state, f, ensure_ascii=False, indent=2)
 
 
-def ensure_game(data: Dict, chat_id: int) -> Dict:
-    key = str(chat_id)
-    if key not in data["games"]:
-        data["games"][key] = {
-            "participants": {},       # user_id -> info
-            "pairs": {},              # giver_user_id -> receiver_user_id
-            "drawn_at": None,         # timestamp
-            "draw_in_progress": False # блокировка на время таймера/жеребьёвки
-        }
-    return data["games"][key]
+def chosen_name_of(user_id: int, state: Dict) -> Optional[str]:
+    return state["chosen"].get(str(user_id))
 
 
-def is_group(chat_type: str) -> bool:
-    return chat_type in ("group", "supergroup")
+def name_taken(name: str, state: Dict) -> bool:
+    return name in state["chosen"].values()
 
 
-def participants_list(game: Dict) -> List[int]:
-    return [int(uid) for uid in game["participants"].keys()]
-
-
-def build_join_keyboard() -> types.InlineKeyboardMarkup:
+# ===== КНОПКИ =====
+def kb_choose_name(state: Dict) -> types.InlineKeyboardMarkup:
     kb = types.InlineKeyboardMarkup()
-    kb.add(types.InlineKeyboardButton("🎁 Участвовать", callback_data="santa_join"))
-    kb.add(types.InlineKeyboardButton("👥 Участники", callback_data="santa_list"))
-    kb.add(types.InlineKeyboardButton("🎲 Жеребьёвка", callback_data="santa_draw"))
-    kb.add(types.InlineKeyboardButton("♻️ Сброс (админы)", callback_data="santa_reset"))
+    for name in PARTICIPANTS:
+        suffix = " ✅" if name_taken(name, state) else ""
+        kb.add(types.InlineKeyboardButton(f"{name}{suffix}", callback_data=f"pick:{name}"))
+    kb.add(types.InlineKeyboardButton("🎲 Жеребьёвка", callback_data="draw"))
+    kb.add(types.InlineKeyboardButton("👤 Мой профиль", callback_data="me"))
     return kb
 
 
-def is_admin(chat_id: int, user_id: int) -> bool:
-    try:
-        member = bot.get_chat_member(chat_id, user_id)
-        return member.status in ("administrator", "creator")
-    except Exception:
-        return False
+def kb_after_draw() -> types.InlineKeyboardMarkup:
+    kb = types.InlineKeyboardMarkup()
+    kb.add(types.InlineKeyboardButton("🎁 Моя пара", callback_data="my_pair"))
+    kb.add(types.InlineKeyboardButton("👤 Мой профиль", callback_data="me"))
+    return kb
 
 
-@bot.message_handler(commands=["start"])
-def start_private(message: types.Message):
-    bot.send_message(
-        message.chat.id,
-        "🎅 <b>Тайный Санта</b>\n\n"
-        "Чтобы участвовать — вернись в группу и нажми <b>🎁 Участвовать</b>.\n\n"
-        "⚠️ Важно: я смогу прислать тебе пару только если ты уже открыл бота в личке и нажал /start ✅"
-    )
+# ===== ЖЕРЕБЬЁВКА =====
+def build_pairs(names: list[str]) -> Dict[str, str]:
+    """Перестановка без самодарения. Работает при len(names) >= 2."""
+    if len(names) < 2:
+        raise ValueError("Нужно минимум 2 участника")
+    receivers = names[:]
+    for _ in range(100):
+        random.shuffle(receivers)
+        if all(g != r for g, r in zip(names, receivers)):
+            return {g: r for g, r in zip(names, receivers)}
+    raise RuntimeError("Не удалось составить пары, попробуйте ещё раз")
 
 
-@bot.message_handler(commands=["santa"])
-def santa_post(message: types.Message):
-    if not is_group(message.chat.type):
-        bot.send_message(message.chat.id, "Эта команда работает только в группе.")
-        return
+def all_registered(state: Dict) -> bool:
+    return len(set(state["chosen"].values())) == len(PARTICIPANTS)
+
+
+# ===== ХЭНДЛЕРЫ =====
+@bot.message_handler(commands=["start", "help"])
+def start(message: types.Message):
+    state = load_state()
+    my = chosen_name_of(message.from_user.id, state)
 
     text = (
         "🎅 <b>Тайный Санта</b>\n\n"
         f"📅 Дата: <b>{EVENT_DATE}</b>\n"
         f"💰 Бюджет: <b>{BUDGET}</b>\n\n"
-        "Нажмите <b>🎁 Участвовать</b>, чтобы войти в игру.\n"
-        "Жеребьёвка запускается с таймером <b>10 секунд</b>.\n"
-        "Пары <b>никому в группе</b> не показываются — бот пишет каждому <b>в личку</b>.\n\n"
-        "⚠️ Если кому-то не приходит личное сообщение — нужно открыть бота и нажать /start."
+        "1) Выбери, кто ты, из списка\n"
+        "2) Когда все выберут себя — нажмите <b>🎲 Жеребьёвка</b>\n\n"
+        "⚠️ Пары никому не показываются, каждый видит только свою."
     )
-    bot.send_message(message.chat.id, text, reply_markup=build_join_keyboard())
+    if my:
+        text += f"\n\n✅ Ты выбран как: <b>{my}</b>"
 
-
-@bot.message_handler(commands=["draw"])
-def draw_cmd(message: types.Message):
-    if not is_group(message.chat.type):
-        bot.send_message(message.chat.id, "Эта команда работает только в группе.")
-        return
-    request_draw_with_timer(chat_id=message.chat.id, requested_by=message.from_user.id, message_id=message.message_id)
+    # если жеребьёвка уже была — показываем быстрые кнопки
+    if state.get("pairs"):
+        bot.send_message(message.chat.id, text, reply_markup=kb_after_draw())
+    else:
+        bot.send_message(message.chat.id, text, reply_markup=kb_choose_name(state))
 
 
 @bot.message_handler(commands=["reset"])
-def reset_cmd(message: types.Message):
-    if not is_group(message.chat.type):
-        bot.send_message(message.chat.id, "Эта команда работает только в группе.")
-        return
-    if not is_admin(message.chat.id, message.from_user.id):
-        bot.send_message(message.chat.id, "♻️ Сброс может делать только админ группы.")
-        return
-    do_reset(message.chat.id, message.from_user.id)
+def reset(message: types.Message):
+    # ВНИМАНИЕ: сейчас reset может сделать любой, потому что это личка.
+    # Если хочешь — добавим "секретный пароль" для reset.
+    state = {"chosen": {}, "pairs": {}, "drawn_at": None}
+    save_state(state)
+    bot.send_message(message.chat.id, "♻️ Сбросил игру. Можно выбирать себя заново.")
 
 
-def do_reset(chat_id: int, requested_by: int):
-    data = load_data()
-    game = ensure_game(data, chat_id)
-    game["pairs"] = {}
-    game["drawn_at"] = None
-    game["draw_in_progress"] = False
-    save_data(data)
-    bot.send_message(chat_id, "♻️ Игра сброшена. Можно заново собирать участников и запускать жеребьёвку.")
+@bot.callback_query_handler(func=lambda call: True)
+def callbacks(call: types.CallbackQuery):
+    state = load_state()
+    uid = call.from_user.id
 
-
-def request_draw_with_timer(chat_id: int, requested_by: int, message_id: Optional[int] = None):
-    data = load_data()
-    game = ensure_game(data, chat_id)
-
-    if game.get("draw_in_progress"):
-        bot.send_message(chat_id, "⏳ Жеребьёвка уже запускается. Подожди немного.")
-        return
-
-    if game.get("drawn_at") and game.get("pairs"):
-        bot.send_message(chat_id, "🔒 Жеребьёвка уже проведена. Повторно нельзя. (Админ может сделать /reset)")
-        return
-
-    users = participants_list(game)
-    if len(users) < 3:
-        bot.send_message(chat_id, "Нужно минимум 3 участника для жеребьёвки.")
-        return
-
-    # ставим блокировку
-    game["draw_in_progress"] = True
-    save_data(data)
-
-    # сообщение обратного отсчёта
-    countdown_msg = bot.send_message(chat_id, f"🎲 Жеребьёвка начнётся через <b>{COUNTDOWN_SECONDS}</b> секунд…")
-
-    # запускаем в отдельном потоке, чтобы бот не “вис”
-    t = threading.Thread(
-        target=countdown_and_draw,
-        args=(chat_id, countdown_msg.message_id),
-        daemon=True
-    )
-    t.start()
-
-
-def countdown_and_draw(chat_id: int, countdown_message_id: int):
-    # обратный отсчёт
-    for sec in range(COUNTDOWN_SECONDS, 0, -1):
-        try:
-            bot.edit_message_text(
-                chat_id=chat_id,
-                message_id=countdown_message_id,
-                text=f"🎲 Жеребьёвка начнётся через <b>{sec}</b> секунд…",
-                parse_mode="HTML"
-            )
-        except Exception:
-            # если не получилось отредактировать — не критично
-            pass
-        time.sleep(1)
-
-    # запускаем жеребьёвку
-    run_draw(chat_id, countdown_message_id)
-
-
-def run_draw(chat_id: int, countdown_message_id: int):
-    data = load_data()
-    game = ensure_game(data, chat_id)
-
-    try:
-        users = participants_list(game)
-        if len(users) < 3:
-            bot.send_message(chat_id, "Недостаточно участников. Жеребьёвка отменена.")
-            return
-
-        # генерируем пары без совпадений
-        receivers = users[:]
-        for _ in range(80):
-            random.shuffle(receivers)
-            if all(g != r for g, r in zip(users, receivers)):
-                break
+    # Показ профиля
+    if call.data == "me":
+        my = chosen_name_of(uid, state)
+        if my:
+            msg = f"👤 Ты: <b>{my}</b>\n"
         else:
-            bot.send_message(chat_id, "Не получилось составить пары. Попробуйте ещё раз.")
+            msg = "👤 Ты пока не выбран.\n"
+
+        msg += f"\nУчастников выбрано: <b>{len(set(state['chosen'].values()))}/{len(PARTICIPANTS)}</b>"
+        if state.get("pairs"):
+            msg += "\n\n🎲 Жеребьёвка уже проведена."
+            bot.answer_callback_query(call.id, "Профиль")
+            bot.send_message(call.message.chat.id, msg, reply_markup=kb_after_draw())
+        else:
+            bot.answer_callback_query(call.id, "Профиль")
+            bot.send_message(call.message.chat.id, msg, reply_markup=kb_choose_name(state))
+        return
+
+    # Выбор имени
+    if call.data.startswith("pick:"):
+        name = call.data.split(":", 1)[1]
+
+        # если жеребьёвка уже прошла — выбор запрещаем
+        if state.get("pairs"):
+            bot.answer_callback_query(call.id, "Жеребьёвка уже была. /reset чтобы начать заново.", show_alert=True)
             return
 
-        pairs = {str(g): int(r) for g, r in zip(users, receivers)}
-        game["pairs"] = pairs
-        game["drawn_at"] = int(time.time())
-        save_data(data)
+        # если это имя уже занято другим
+        current_owner = None
+        for k, v in state["chosen"].items():
+            if v == name:
+                current_owner = int(k)
+                break
 
+        if current_owner is not None and current_owner != uid:
+            bot.answer_callback_query(call.id, "Это имя уже выбрал другой участник.", show_alert=True)
+            return
+
+        # если пользователь ранее выбрал другое имя — просто перезапишем
+        state["chosen"][str(uid)] = name
+        save_state(state)
+
+        bot.answer_callback_query(call.id, f"Ты выбрал: {name}")
+        bot.send_message(call.message.chat.id, f"✅ Теперь ты: <b>{name}</b>", reply_markup=kb_choose_name(state))
+        return
+
+    # Жеребьёвка
+    if call.data == "draw":
+        if state.get("pairs"):
+            bot.answer_callback_query(call.id, "Жеребьёвка уже проведена.", show_alert=True)
+            bot.send_message(call.message.chat.id, "🎲 Жеребьёвка уже была. Нажми «🎁 Моя пара».", reply_markup=kb_after_draw())
+            return
+
+        if not all_registered(state):
+            bot.answer_callback_query(call.id, "Ещё не все выбрали себя.", show_alert=True)
+            bot.send_message(
+                call.message.chat.id,
+                f"⏳ Ещё не все выбрали себя: <b>{len(set(state['chosen'].values()))}/{len(PARTICIPANTS)}</b>\n"
+                "Пусть каждый нажмёт /start и выберет себя.",
+                reply_markup=kb_choose_name(state)
+            )
+            return
+
+        # Таймер 10 секунд (без редактирования сообщений, просто считаем)
+        bot.answer_callback_query(call.id, "Запускаю…")
+        msg = bot.send_message(call.message.chat.id, "🎲 Жеребьёвка начнётся через <b>10</b> секунд…")
+        for s in range(9, 0, -1):
+            time.sleep(1)
+            try:
+                bot.edit_message_text(
+                    chat_id=msg.chat.id,
+                    message_id=msg.message_id,
+                    text=f"🎲 Жеребьёвка начнётся через <b>{s}</b> секунд…",
+                    parse_mode="HTML"
+                )
+            except Exception:
+                pass
+
+        # строим пары по именам
+        names = PARTICIPANTS[:]  # фиксированный список
+        pairs = build_pairs(names)
+        state["pairs"] = pairs
+        state["drawn_at"] = int(time.time())
+        save_state(state)
+
+        # рассылаем каждому его пару (по user_id -> chosen name)
         sent = 0
         failed = 0
+        for user_id_str, my_name in state["chosen"].items():
+            user_id = int(user_id_str)
+            receiver_name = pairs.get(my_name)
 
-        for giver_str, receiver_id in pairs.items():
-            giver_id = int(giver_str)
-            receiver_info = game["participants"].get(str(receiver_id), {})
-            receiver_name = receiver_info.get("first_name") or receiver_info.get("username") or f"id:{receiver_id}"
-
-            msg = (
-                "🎅 <b>Тайный Санта — твоя пара</b>\n\n"
-                f"Ты даришь подарок: <b>{receiver_name}</b>\n"
-                f"📅 Дата: <b>{EVENT_DATE}</b>\n"
-                f"💰 Бюджет: <b>{BUDGET}</b>\n\n"
-                "Пожалуйста, не раскрывай пару в чате 🙂"
-            )
             try:
-                bot.send_message(giver_id, msg)
+                bot.send_message(
+                    user_id,
+                    "🎅 <b>Тайный Санта — твоя пара</b>\n\n"
+                    f"Ты даришь: <b>{receiver_name}</b>\n"
+                    f"📅 Дата: <b>{EVENT_DATE}</b>\n"
+                    f"💰 Бюджет: <b>{BUDGET}</b>\n\n"
+                    "Пожалуйста, не раскрывай пару 🙂",
+                    reply_markup=kb_after_draw()
+                )
                 sent += 1
             except Exception:
                 failed += 1
 
-        # в группе — без раскрытия пар
-        try:
-            bot.edit_message_text(
-                chat_id=chat_id,
-                message_id=countdown_message_id,
-                text=(
-                    "🎲 <b>Жеребьёвка проведена!</b>\n"
-                    f"✅ Отправлено в личку: <b>{sent}</b>\n"
-                    f"⚠️ Не доставлено: <b>{failed}</b>\n\n"
-                    "Если кому-то не пришло — нужно открыть бота в личке и нажать /start.\n"
-                    "Повторная жеребьёвка заблокирована. (Админ может сделать /reset)"
-                ),
-                parse_mode="HTML"
-            )
-        except Exception:
-            bot.send_message(
-                chat_id,
-                f"🎲 Жеребьёвка проведена! В личку отправлено: {sent}, не доставлено: {failed}"
-            )
-
-    finally:
-        # снимаем блокировку в любом случае
-        data = load_data()
-        game = ensure_game(data, chat_id)
-        game["draw_in_progress"] = False
-        save_data(data)
-
-
-@bot.callback_query_handler(func=lambda call: call.data in ("santa_join", "santa_list", "santa_draw", "santa_reset"))
-def santa_callbacks(call: types.CallbackQuery):
-    chat = call.message.chat
-    user = call.from_user
-
-    if not is_group(chat.type):
-        bot.answer_callback_query(call.id, "Это работает только в группе.")
+        bot.edit_message_text(
+            chat_id=msg.chat.id,
+            message_id=msg.message_id,
+            text=(
+                "✅ <b>Жеребьёвка проведена!</b>\n\n"
+                "Каждому участнику отправил пару в личку.\n"
+                f"Отправлено: <b>{sent}</b>, не доставлено: <b>{failed}</b>\n\n"
+                "Нажми «🎁 Моя пара»."
+            ),
+            parse_mode="HTML"
+        )
         return
 
-    data = load_data()
-    game = ensure_game(data, chat.id)
-
-    if call.data == "santa_join":
-        game["participants"][str(user.id)] = {
-            "username": user.username,
-            "first_name": user.first_name,
-            "joined_at": int(time.time())
-        }
-        save_data(data)
-        bot.answer_callback_query(call.id, "Ты участвуешь ✅")
-        bot.send_message(chat.id, f"✅ {user.first_name} участвует! Всего: {len(game['participants'])}")
-
-    elif call.data == "santa_list":
-        names = []
-        for uid_str, info in game["participants"].items():
-            n = info.get("first_name") or info.get("username") or f"id:{uid_str}"
-            names.append(n)
-        if not names:
-            bot.answer_callback_query(call.id, "Пока никто не участвует.")
+    # Показать свою пару
+    if call.data == "my_pair":
+        if not state.get("pairs"):
+            bot.answer_callback_query(call.id, "Жеребьёвки ещё не было.", show_alert=True)
+            bot.send_message(call.message.chat.id, "🎲 Жеребьёвки ещё не было. Сначала выберите себя и нажмите «Жеребьёвка».")
             return
-        text = "👥 <b>Участники</b>:\n" + "\n".join(f"• {n}" for n in names)
-        bot.answer_callback_query(call.id, "Ок.")
-        bot.send_message(chat.id, text)
 
-    elif call.data == "santa_draw":
-        bot.answer_callback_query(call.id, "Ок, запускаю…")
-        request_draw_with_timer(chat_id=chat.id, requested_by=user.id, message_id=call.message.message_id)
-
-    elif call.data == "santa_reset":
-        if not is_admin(chat.id, user.id):
-            bot.answer_callback_query(call.id, "Только админ может сбросить.")
+        my = chosen_name_of(uid, state)
+        if not my:
+            bot.answer_callback_query(call.id, "Сначала выбери себя.", show_alert=True)
+            bot.send_message(call.message.chat.id, "Сначала нажми /start и выбери, кто ты.")
             return
-        bot.answer_callback_query(call.id, "Сбросил.")
-        do_reset(chat.id, user.id)
+
+        receiver = state["pairs"].get(my)
+        bot.answer_callback_query(call.id, "Твоя пара")
+        bot.send_message(
+            call.message.chat.id,
+            "🎁 <b>Твоя пара</b>\n\n"
+            f"Ты даришь: <b>{receiver}</b>\n"
+            f"📅 Дата: <b>{EVENT_DATE}</b>\n"
+            f"💰 Бюджет: <b>{BUDGET}</b>",
+            reply_markup=kb_after_draw()
+        )
+        return
+
+    bot.answer_callback_query(call.id, "Неизвестная кнопка.")
 
 
 if __name__ == "__main__":
