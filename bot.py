@@ -13,13 +13,12 @@ TOKEN = os.getenv("TOKEN")
 if not TOKEN:
     raise RuntimeError("TOKEN env var is not set")
 
-# Код админа (обязателен). Пример на сервере: export ADMIN_CODE="santa2025"
-ADMIN_CODE = os.getenv("ADMIN_CODE")
-if not ADMIN_CODE:
-    raise RuntimeError("ADMIN_CODE env var is not set")
+# Код админа (желательно задать на сервере: export ADMIN_CODE="santa2025")
+# Если не задан — кнопка "👑 Администратор" будет скрыта, а жеребьёвка недоступна.
+ADMIN_CODE = os.getenv("ADMIN_CODE", "").strip()
 
-# Код сброса (необязателен). Пример: export RESET_CODE="reset2025"
-RESET_CODE = os.getenv("RESET_CODE")
+# Код сброса (необязателен). export RESET_CODE="reset2025"
+RESET_CODE = os.getenv("RESET_CODE", "").strip()
 
 EVENT_TITLE = "🎄 Тайный Санта 2025"
 EVENT_DATE = "25.12.2025"
@@ -142,12 +141,16 @@ def panel_text(user_id: int, state: Dict) -> str:
         f"{progress_line(state)}\n"
         f"👑 Администратор: <b>{admin_mark}</b>\n"
     )
+
+    if not ADMIN_CODE:
+        t += "\n\n⚠️ <i>ADMIN_CODE не задан на сервере — подтверждение админа и жеребьёвка отключены.</i>"
+
     if is_admin(user_id, state):
-        t += "\n👑 Ты админ. Ты не участвуешь в жеребьёвке, пары тебе не будет."
+        t += "\n\n👑 Ты админ. Ты не участвуешь в жеребьёвке, пары тебе не будет."
     elif my:
-        t += f"\n👤 Ты: <b>{my}</b> ✅"
+        t += f"\n\n👤 Ты: <b>{my}</b> ✅"
     else:
-        t += "\n👤 Ты ещё не выбран."
+        t += "\n\n👤 Ты ещё не выбран."
     return t
 
 
@@ -160,8 +163,10 @@ def kb_choose(user_id: int, state: Dict) -> types.InlineKeyboardMarkup:
         mark = " ✅" if name_taken(name, state) else ""
         kb.add(types.InlineKeyboardButton(f"🎁 {name}{mark}", callback_data=f"pick:{name}"))
 
-    # 👑 кнопка администратора исчезает после подтверждения
-    if state.get("admin_id") is None:
+    # 👑 кнопка администратора:
+    # - показываем только если ADMIN_CODE задан
+    # - и админ ещё не подтверждён (исчезает после подтверждения)
+    if ADMIN_CODE and state.get("admin_id") is None:
         kb.add(types.InlineKeyboardButton("👑 Администратор", callback_data="admin"))
 
     kb.add(types.InlineKeyboardButton("👤 Профиль", callback_data="me"))
@@ -228,7 +233,7 @@ def broadcast_refresh() -> None:
             send_or_update_panel(uid)
         except Exception:
             dead.append(uid_str)
-        time.sleep(0.1)
+        time.sleep(0.05)
 
     if dead:
         state = load_state()
@@ -254,11 +259,6 @@ def start(message: types.Message):
     broadcast_refresh()
 
 
-@bot.message_handler(commands=["myid"])
-def myid(message: types.Message):
-    bot.send_message(message.chat.id, f"🆔 Твой ID: <code>{message.from_user.id}</code>")
-
-
 @bot.message_handler(commands=["reset"])
 def reset(message: types.Message):
     if not RESET_CODE:
@@ -277,6 +277,7 @@ def reset(message: types.Message):
     state["admin_id"] = None
     state["admin_pending"] = {}
     save_state(state)
+    bot.send_message(message.chat.id, "✅ Сброс выполнен.")
     broadcast_refresh()
 
 
@@ -286,16 +287,27 @@ def catch_admin_code(message: types.Message):
     state = load_state()
     uid_str = str(message.from_user.id)
 
+    # если мы не ждём код от этого пользователя — игнорируем
     if not state["admin_pending"].get(uid_str):
-        return  # обычные сообщения игнорируем
+        return
+
+    # если ADMIN_CODE не задан — отменяем
+    if not ADMIN_CODE:
+        state["admin_pending"].pop(uid_str, None)
+        save_state(state)
+        bot.send_message(message.chat.id, "⚠️ ADMIN_CODE не задан на сервере, подтверждение админа отключено.")
+        broadcast_refresh()
+        return
 
     code = (message.text or "").strip()
     if code != ADMIN_CODE:
         bot.send_message(message.chat.id, "❌ Неверный код. Попробуй ещё раз.")
         return
 
-    # назначаем админа
-    state["admin_id"] = message.from_user.id
+    # назначаем админа (и блокируем повторные назначения)
+    if state.get("admin_id") is None:
+        state["admin_id"] = message.from_user.id
+
     state["admin_pending"].pop(uid_str, None)
     save_state(state)
 
@@ -310,6 +322,7 @@ def callbacks(call: types.CallbackQuery):
     uid = call.from_user.id
 
     def answer(text: str, alert: bool = False):
+        # глушим "query is too old" и подобные
         try:
             bot.answer_callback_query(call.id, text, show_alert=alert)
         except Exception:
@@ -321,7 +334,10 @@ def callbacks(call: types.CallbackQuery):
         return
 
     if call.data == "admin":
-        # если админ уже назначен — просто скажем
+        if not ADMIN_CODE:
+            answer("На сервере не задан ADMIN_CODE.", alert=True)
+            return
+
         if state.get("admin_id") is not None:
             answer("Администратор уже подтверждён.", alert=True)
             return
@@ -359,12 +375,10 @@ def callbacks(call: types.CallbackQuery):
         state["chosen"][str(uid)] = name
         save_state(state)
         answer(f"Готово: {name} ✅")
-
         broadcast_refresh()
         return
 
     if call.data == "draw":
-        # только админ
         if not is_admin(uid, state):
             answer("Жеребьёвку запускает только админ 👑", alert=True)
             return
@@ -379,6 +393,7 @@ def callbacks(call: types.CallbackQuery):
             answer("Ещё не все участники выбрали себя.", alert=True)
             return
 
+        # блокируем
         state["draw_in_progress"] = True
         save_state(state)
         broadcast_refresh()
@@ -399,6 +414,7 @@ def callbacks(call: types.CallbackQuery):
 
         try:
             pairs = build_pairs(PARTICIPANTS[:])
+
             state = load_state()
             state["pairs"] = pairs
             state["drawn_at"] = int(time.time())
@@ -420,12 +436,16 @@ def callbacks(call: types.CallbackQuery):
                     reply_markup=kb_after_draw(user_id, state)
                 )
 
-            bot.edit_message_text(
-                chat_id=msg.chat.id,
-                message_id=msg.message_id,
-                text="✅ <b>Жеребьёвка проведена!</b>\n\nПары разосланы участникам 🎁",
-                parse_mode="HTML"
-            )
+            try:
+                bot.edit_message_text(
+                    chat_id=msg.chat.id,
+                    message_id=msg.message_id,
+                    text="✅ <b>Жеребьёвка проведена!</b>\n\nПары разосланы участникам 🎁",
+                    parse_mode="HTML"
+                )
+            except Exception:
+                pass
+
         finally:
             state = load_state()
             state["draw_in_progress"] = False
