@@ -28,6 +28,12 @@ PARTICIPANTS: List[str] = [
     "Юлия",
 ]
 
+# Организатор (ты)
+DRAW_OWNER_USERNAME = "kudlexx"  # без @
+# Самый надежный вариант — ID. Можно задать на сервере:
+# export DRAW_OWNER_ID="123456789"
+DRAW_OWNER_ID = int(os.getenv("DRAW_OWNER_ID", "0"))
+
 DATA_FILE = "santa_state.json"
 
 bot = telebot.TeleBot(TOKEN, parse_mode="HTML")
@@ -77,6 +83,13 @@ def all_registered(state: Dict) -> bool:
     return len(set(state["chosen"].values())) == len(PARTICIPANTS)
 
 
+def is_draw_owner(user_id: int, username: Optional[str]) -> bool:
+    uname = (username or "").lower().lstrip("@")
+    if DRAW_OWNER_ID and user_id == DRAW_OWNER_ID:
+        return True
+    return uname == DRAW_OWNER_USERNAME.lower()
+
+
 # ================== ТЕКСТЫ ==================
 def header() -> str:
     return (
@@ -114,7 +127,7 @@ def panel_text(user_id: int, state: Dict) -> str:
         "🎅 Правила:\n"
         "1) Выбери, <b>кто ты</b>\n"
         "2) После выбора <b>менять нельзя</b>\n"
-        "3) Когда все выберут себя — появится <b>🎲 Жеребьёвка</b>\n\n"
+        "3) Когда все выберут себя — организатор запустит жеребьёвку\n\n"
         f"{progress_line(state)}\n"
     )
     if my:
@@ -134,8 +147,12 @@ def kb_choose(user_id: int, state: Dict) -> types.InlineKeyboardMarkup:
 
     kb.add(types.InlineKeyboardButton("👤 Профиль", callback_data="me"))
 
+    # ✅ Показываем кнопку жеребьёвки ТОЛЬКО организатору и только когда все готовы
     if all_registered(state) and not state["pairs"] and not state["draw_in_progress"]:
-        kb.add(types.InlineKeyboardButton("🎲 Жеребьёвка", callback_data="draw"))
+        if DRAW_OWNER_ID and user_id == DRAW_OWNER_ID:
+            kb.add(types.InlineKeyboardButton("🎲 Жеребьёвка", callback_data="draw"))
+        # если DRAW_OWNER_ID не задан — кнопку скрываем (иначе не можем понять, кто организатор по user_id)
+        # при этом защита всё равно сработает в обработчике draw по username
 
     return kb
 
@@ -159,7 +176,6 @@ def safe_edit_message(chat_id: int, message_id: int, text: str, markup: Optional
         )
         return True
     except ApiTelegramException as e:
-        # "message is not modified" — это не ошибка для нас
         if "message is not modified" in str(e).lower():
             return True
         return False
@@ -179,7 +195,6 @@ def send_or_update_panel(user_id: int) -> None:
         if ok:
             return
 
-    # если не было панели или не удалось отредактировать — создаём новую
     sent = bot.send_message(user_id, txt, reply_markup=markup)
     state = load_state()
     state["ui"][str(user_id)] = {"chat_id": sent.chat.id, "message_id": sent.message_id}
@@ -214,13 +229,16 @@ def build_pairs(names: List[str]) -> Dict[str, str]:
     raise RuntimeError("Не удалось составить пары.")
 
 
-# ================== /start ==================
+# ================== /start и /myid ==================
 @bot.message_handler(commands=["start", "help"])
 def start(message: types.Message):
-    # создаём/обновляем панель пользователю
     send_or_update_panel(message.from_user.id)
-    # и обновим всем (на случай, если кто-то только что выбрал/сбросил и т.п.)
     broadcast_refresh()
+
+
+@bot.message_handler(commands=["myid"])
+def myid(message: types.Message):
+    bot.send_message(message.chat.id, f"🆔 Твой ID: <code>{message.from_user.id}</code>")
 
 
 # ================== /reset ==================
@@ -280,23 +298,16 @@ def callbacks(call: types.CallbackQuery):
 
         bot.answer_callback_query(call.id, f"Готово: {name} ✅")
 
-        # СРАЗУ обновим сообщение, по которому нажали (чтобы галочка появилась моментально)
-        state2 = load_state()
-        try:
-            safe_edit_message(
-                chat_id=call.message.chat.id,
-                message_id=call.message.message_id,
-                text=panel_text(uid, state2),
-                markup=kb_after_draw() if state2["pairs"] else kb_choose(uid, state2)
-            )
-        except Exception:
-            pass
-
-        # и обновим всем остальным
+        # обновим всем
         broadcast_refresh()
         return
 
     if call.data == "draw":
+        # 🔒 ЖЕСТКАЯ ЗАЩИТА: запускать может только организатор
+        if not is_draw_owner(uid, call.from_user.username):
+            bot.answer_callback_query(call.id, "Жеребьёвку запускает только организатор 👑", show_alert=True)
+            return
+
         if state["pairs"]:
             bot.answer_callback_query(call.id, "Уже проведено.", show_alert=True)
             return
@@ -307,7 +318,6 @@ def callbacks(call: types.CallbackQuery):
             bot.answer_callback_query(call.id, "Ещё не все выбрали себя.", show_alert=True)
             return
 
-        # блокируем
         state["draw_in_progress"] = True
         save_state(state)
         broadcast_refresh()
@@ -350,7 +360,7 @@ def callbacks(call: types.CallbackQuery):
             bot.edit_message_text(
                 chat_id=msg.chat.id,
                 message_id=msg.message_id,
-                text="✅ <b>Жеребьёвка проведена!</b>\n\nНажми «🎁 Моя пара».",
+                text="✅ <b>Жеребьёвка проведена!</b>\n\nПары разосланы в личку 🎁",
                 parse_mode="HTML"
             )
         finally:
